@@ -12,7 +12,7 @@ import os
 # from utils.voc_classname_encoder import classname_to_ids
 # os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 os.environ['CUDA_VISIBLE_DEVICES'] = '2'
-lr = 0.001
+lr = 0.01
 batch_size = 15
 buffer_size = 256
 epochs = 160
@@ -25,6 +25,9 @@ config = {
     'weight_decay': 1e-4,
     'keep_prob': 0.5,                                      # not used
     'batch_size': batch_size,
+
+    'score_threshold': 0.1,
+    'top_k_results_output': 100
 }
 
 image_augmentor_config = {
@@ -52,7 +55,7 @@ trainset_provider = {
     'val_generator': None                                 # not used
 }
 centernet = net.CenterNet(config, trainset_provider)
-# centernet.load_weight('./centernet/test-34457')
+# centernet.load_weight('./centernet/test-1670')
 for i in range(epochs):
     print('-'*25, 'epoch', i, '-'*25)
     if i in reduce_lr_epoch:

@@ -34,6 +34,9 @@ class CenterNet:
             if data_provider['val_generator'] is not None:
                 self.val_generator = data_provider['val_generator']
                 self.val_initializer, self.val_iterator = self.val_generator
+        else:
+            self.score_threshold = config['score_threshold']
+            self.top_k_results_output = config['top_k_results_output']
 
         self.global_step = tf.get_variable(name='global_step', initializer=tf.constant(0), trainable=False)
         self.is_training = True
@@ -107,25 +110,26 @@ class CenterNet:
             dla_stage6 = self._max_pooling(dla_stage6, 2, 2)
             dla_stage6 = dla_stage6 + residual
         with tf.variable_scope('upsampling'):
-            dla_stage6 = self._conv_bn_activation(dla_stage6, 256, 3, 1)
+            dla_stage6 = self._conv_bn_activation(dla_stage6, 256, 1, 1)
             dla_stage6_5 = self._dconv_bn_activation(dla_stage6, 256, 4, 2)
             dla_stage6_4 = self._dconv_bn_activation(dla_stage6_5, 256, 4, 2)
             dla_stage6_3 = self._dconv_bn_activation(dla_stage6_4, 256, 4, 2)
 
-            dla_stage5 = self._conv_bn_activation(dla_stage5, 256, 3, 1)
+            dla_stage5 = self._conv_bn_activation(dla_stage5, 256, 1, 1)
             dla_stage5_4 = self._conv_bn_activation(dla_stage5+dla_stage6_5, 256, 3, 1)
             dla_stage5_4 = self._dconv_bn_activation(dla_stage5_4, 256, 4, 2)
             dla_stage5_3 = self._dconv_bn_activation(dla_stage5_4, 256, 4, 2)
 
-            dla_stage4 = self._conv_bn_activation(dla_stage4, 256, 3, 1)
-            dla_stage4_3 = self._conv_bn_activation(dla_stage4+ dla_stage5_4+dla_stage6_4, 256, 3, 1)
+            dla_stage4 = self._conv_bn_activation(dla_stage4, 256, 1, 1)
+            dla_stage4_3 = self._conv_bn_activation(dla_stage4+dla_stage5_4+dla_stage6_4, 256, 3, 1)
             dla_stage4_3 = self._dconv_bn_activation(dla_stage4_3, 256, 4, 2)
 
             features = self._conv_bn_activation(dla_stage6_3+dla_stage5_3+dla_stage4_3, 256, 3, 1)
+            features = self._conv_bn_activation(features, 256, 1, 1)
             stride = 4.0
 
         with tf.variable_scope('center_detector'):
-            keypoints = self._conv_bn_activation(features, self.num_classes, 3, 1, tf.nn.sigmoid)
+            keypoints = self._conv_bn_activation(features, self.num_classes, 3, 1, None)
             offset = self._conv_bn_activation(features, 2, 3, 1, None)
             size = self._conv_bn_activation(features, 2, 3, 1, None)
             if self.data_format == 'channels_first':
@@ -153,6 +157,7 @@ class CenterNet:
                 meshgrid_y = tf.expand_dims(meshgrid_y, axis=-1)
                 meshgrid_x = tf.expand_dims(meshgrid_x, axis=-1)
                 center = tf.concat([meshgrid_y, meshgrid_x], axis=-1)
+                keypoints = tf.nn.sigmoid(keypoints)
                 keypoints_peak = self._max_pooling(keypoints, 3, 1)
                 keypoints_mask = tf.cast(tf.equal(keypoints, keypoints_peak), tf.float32)
                 keypoints = keypoints * keypoints_mask
@@ -164,7 +169,7 @@ class CenterNet:
                     bbox_yx_i = tf.reshape(center + offset, [-1, 2])
                     bbox_hw_i = tf.reshape(size, [-1, 2])
                     scores_i = tf.reshape(keypoints[..., i], [-1])
-                    mask_i = scores_i > 0.
+                    mask_i = scores_i > self.score_threshold
                     bbox_yx_i = tf.boolean_mask(bbox_yx_i, mask_i)
                     bbox_hw_i = tf.boolean_mask(bbox_hw_i, mask_i)
                     scores_i = tf.boolean_mask(scores_i, mask_i)
@@ -177,12 +182,12 @@ class CenterNet:
                 bbox_hw = tf.concat(bbox_hw, axis=0)
                 scores = tf.concat(scores, axis=0)
                 class_id = tf.concat(class_id, axis=0)
-                num_select = tf.cond(tf.shape(scores)[0] > 100, lambda: 100, lambda: tf.shape(scores)[0])
+                num_select = tf.cond(tf.shape(scores)[0] > self.top_k_results_output, lambda: self.top_k_results_output, lambda: tf.shape(scores)[0])
                 select_scores, select_indices = tf.nn.top_k(scores, num_select)
                 select_bbox_yx = tf.gather(bbox_yx, select_indices)
                 select_bbox_hw = tf.gather(bbox_hw, select_indices)
                 select_class_id = tf.gather(class_id, select_indices)
-                select_bbox_y1x1y2x2 = tf.concat([select_bbox_yx, select_bbox_hw], axis=-1) * stride
+                select_bbox_y1x1y2x2 = tf.concat([select_bbox_yx-select_bbox_hw/2., select_bbox_yx+select_bbox_hw/2.], axis=-1) * stride
                 self.detection_pred = [select_scores, select_bbox_y1x1y2x2, select_class_id]
 
     def _compute_one_image_loss(self, keypoints, offset, size, ground_truth, meshgrid_y, meshgrid_x,
@@ -198,7 +203,7 @@ class CenterNet:
         noffset_y = ngbbox_y - ngbbox_yx[..., 0]
         noffset_x = ngbbox_x - ngbbox_yx[..., 1]
         ngbbox_yx = tf.cast(ngbbox_yx, tf.int64)
-        num_g = tf.shape(class_id)[0]
+        num_g = tf.cast(tf.shape(class_id)[0], tf.float32)
 
         keypoints_loss = self._keypoints_loss(keypoints, ngbbox_yx, ngbbox_y, ngbbox_x, ngbbox_h,
                                               ngbbox_w, class_id, meshgrid_y, meshgrid_x, pshape)
@@ -210,21 +215,21 @@ class CenterNet:
         offset_x_dense = tf.sparse.to_dense(tf.sparse.SparseTensor(ngbbox_yx, noffset_x, dense_shape=pshape), validate_indices=False)
         offset_gt = tf.concat(
             [
-                tf.expand_dims(size_h_dense, axis=-1),
-                tf.expand_dims(size_w_dense, axis=-1),
-            ], axis=-1
-        )
-        size_gt = tf.concat(
-            [
                 tf.expand_dims(offset_y_dense, axis=-1),
                 tf.expand_dims(offset_x_dense, axis=-1),
             ], axis=-1
         )
+        size_gt = tf.concat(
+            [
+                tf.expand_dims(size_h_dense, axis=-1),
+                tf.expand_dims(size_w_dense, axis=-1),
+            ], axis=-1
+        )
         offset = offset * tf.expand_dims(mask, axis=-1)
         size = size * tf.expand_dims(mask, axis=-1)
-        offset_loss = tf.reduce_sum(tf.abs(offset_gt - offset)) / tf.cast(num_g, tf.float32)
-        size_loss = tf.reduce_sum(tf.abs(size_gt - size)) / tf.cast(num_g, tf.float32)
-        total_loss = keypoints_loss + 0.1 * size_loss + offset_loss
+        offset_loss = tf.reduce_sum(tf.abs(offset_gt - offset)) / num_g
+        size_loss = tf.reduce_sum(tf.abs(size_gt - size)) / num_g
+        total_loss = keypoints_loss + 0.1*size_loss + offset_loss
         return total_loss
 
     def _keypoints_loss(self, keypoints, gbbox_yx, gbbox_y, gbbox_x, gbbox_h, gbbox_w,
@@ -242,7 +247,7 @@ class CenterNet:
 
         keyp_penalty_reduce = tf.exp(-((gbbox_y-meshgrid_y)**2 + (gbbox_x-meshgrid_x)**2)/(2*sigma**2))
         zero_like_keyp = tf.expand_dims(tf.zeros(pshape, dtype=tf.float32), axis=-1)
-        reduce = []
+        reduction = []
         gt_keypoints = []
         for i in range(self.num_classes):
             exist_i = tf.equal(classid, i)
@@ -252,7 +257,7 @@ class CenterNet:
                 lambda: zero_like_keyp,
                 lambda: tf.expand_dims(tf.reduce_max(reduce_i, axis=0), axis=-1)
             )
-            reduce.append(reduce_i)
+            reduction.append(reduce_i)
 
             gbbox_yx_i = tf.boolean_mask(gbbox_yx, exist_i)
             gt_keypoints_i = tf.cond(
@@ -262,13 +267,12 @@ class CenterNet:
                                        axis=-1)
             )
             gt_keypoints.append(gt_keypoints_i)
-        reduce = tf.concat(reduce, axis=-1)
+        reduction = tf.concat(reduction, axis=-1)
         gt_keypoints = tf.concat(gt_keypoints, axis=-1)
-        keypoints_pos_loss = tf.pow(1.-keypoints, 2.) * tf.log(keypoints+1e-8) * gt_keypoints
-        keypoints_neg_loss = tf.pow(1.-reduce, 4.) * tf.pow(keypoints, 2.) * tf.log(1.-keypoints+1e-8) * (1.-gt_keypoints)
-        keypoints_pos_loss = -tf.reduce_sum(keypoints_pos_loss) / tf.cast(num_g, tf.float32)
-        keypoints_neg_loss = -tf.reduce_sum(tf.reduce_mean(keypoints_neg_loss, axis=[0, 1]))
-        return keypoints_pos_loss + keypoints_neg_loss
+        keypoints_pos_loss = -tf.pow(1.-tf.nn.sigmoid(keypoints), 2.) * tf.log_sigmoid(keypoints) * gt_keypoints
+        keypoints_neg_loss = -tf.pow(1.-reduction, 4.) * tf.pow(tf.nn.sigmoid(keypoints), 2.) * (-keypoints+tf.log_sigmoid(keypoints)) * (1.-gt_keypoints)
+        keypoints_loss = (tf.reduce_sum(keypoints_pos_loss) + tf.reduce_sum(keypoints_neg_loss)) / tf.cast(num_g, tf.float32)
+        return keypoints_loss
 
     def _gaussian_radius(self, height, width, min_overlap=0.7):
         a1 = 1.
@@ -354,8 +358,7 @@ class CenterNet:
             kernel_size=kernel_size,
             strides=strides,
             padding='same',
-            data_format=self.data_format,
-            kernel_initializer=tf.contrib.layers.variance_scaling_initializer(),
+            data_format=self.data_format
         )
         bn = self._bn(conv)
         if activation is not None:
