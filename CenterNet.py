@@ -129,7 +129,7 @@ class CenterNet:
             stride = 4.0
 
         with tf.variable_scope('center_detector'):
-            keypoints = self._conv_bn_activation(features, self.num_classes, 3, 1, None)
+            keypoints = self._conv_bn_activation(features, self.num_classes, 3, 1, tf.nn.sigmoid)
             offset = self._conv_bn_activation(features, 2, 3, 1, None)
             size = self._conv_bn_activation(features, 2, 3, 1, None)
             if self.data_format == 'channels_first':
@@ -140,7 +140,7 @@ class CenterNet:
 
             h = tf.range(0., tf.cast(pshape[0], tf.float32), dtype=tf.float32)
             w = tf.range(0., tf.cast(pshape[1], tf.float32), dtype=tf.float32)
-            [meshgrid_y, meshgrid_x] = tf.meshgrid(h, w)
+            [meshgrid_x, meshgrid_y] = tf.meshgrid(w, h)
             if self.mode == 'train':
                 total_loss = []
                 for i in range(self.batch_size):
@@ -157,38 +157,60 @@ class CenterNet:
                 meshgrid_y = tf.expand_dims(meshgrid_y, axis=-1)
                 meshgrid_x = tf.expand_dims(meshgrid_x, axis=-1)
                 center = tf.concat([meshgrid_y, meshgrid_x], axis=-1)
-                keypoints = tf.nn.sigmoid(keypoints)
+                category = tf.expand_dims(tf.squeeze(tf.argmax(keypoints, axis=-1, output_type=tf.int32)), axis=-1)
+                meshgrid_xyz = tf.concat([tf.zeros_like(category), tf.cast(center, tf.int32), category], axis=-1)
+                keypoints = tf.gather_nd(keypoints, meshgrid_xyz)
+                keypoints = tf.expand_dims(keypoints, axis=0)
+                keypoints = tf.expand_dims(keypoints, axis=-1)
                 keypoints_peak = self._max_pooling(keypoints, 3, 1)
                 keypoints_mask = tf.cast(tf.equal(keypoints, keypoints_peak), tf.float32)
                 keypoints = keypoints * keypoints_mask
-                scores = []
-                bbox_yx = []
-                bbox_hw = []
-                class_id = []
-                for i in range(self.num_classes):
-                    bbox_yx_i = tf.reshape(center + offset, [-1, 2])
-                    bbox_hw_i = tf.reshape(size, [-1, 2])
-                    scores_i = tf.reshape(keypoints[..., i], [-1])
-                    mask_i = scores_i > self.score_threshold
-                    bbox_yx_i = tf.boolean_mask(bbox_yx_i, mask_i)
-                    bbox_hw_i = tf.boolean_mask(bbox_hw_i, mask_i)
-                    scores_i = tf.boolean_mask(scores_i, mask_i)
-                    class_id_i = tf.zeros_like(scores_i, tf.int32) + i
-                    bbox_yx.append(bbox_yx_i)
-                    bbox_hw.append(bbox_hw_i)
-                    scores.append(scores_i)
-                    class_id.append(class_id_i)
-                bbox_yx = tf.concat(bbox_yx, axis=0)
-                bbox_hw = tf.concat(bbox_hw, axis=0)
-                scores = tf.concat(scores, axis=0)
-                class_id = tf.concat(class_id, axis=0)
+                scores = tf.reshape(keypoints, [-1])
+                class_id = tf.reshape(category, [-1])
+                bbox_yx = tf.reshape(center+offset, [-1, 2])
+                bbox_hw = tf.reshape(size, [-1, 2])
+                score_mask = scores > self.score_threshold
+                scores = tf.boolean_mask(scores, score_mask)
+                class_id = tf.boolean_mask(class_id, score_mask)
+                bbox_yx = tf.boolean_mask(bbox_yx, score_mask)
+                bbox_hw = tf.boolean_mask(bbox_hw, score_mask)
+                bbox = tf.concat([bbox_yx-bbox_hw/2., bbox_yx+bbox_hw/2.], axis=-1) * stride
                 num_select = tf.cond(tf.shape(scores)[0] > self.top_k_results_output, lambda: self.top_k_results_output, lambda: tf.shape(scores)[0])
                 select_scores, select_indices = tf.nn.top_k(scores, num_select)
-                select_bbox_yx = tf.gather(bbox_yx, select_indices)
-                select_bbox_hw = tf.gather(bbox_hw, select_indices)
                 select_class_id = tf.gather(class_id, select_indices)
-                select_bbox_y1x1y2x2 = tf.concat([select_bbox_yx-select_bbox_hw/2., select_bbox_yx+select_bbox_hw/2.], axis=-1) * stride
-                self.detection_pred = [select_scores, select_bbox_y1x1y2x2, select_class_id]
+                select_bbox = tf.gather(bbox, select_indices)
+                self.detection_pred = [select_scores, select_bbox, select_class_id]
+
+                # per class nms
+                # keypoints_peak = self._max_pooling(keypoints, 3, 1)
+                # keypoints_mask = tf.cast(tf.equal(keypoints, keypoints_peak), tf.float32)
+                # keypoints = keypoints * keypoints_mask
+                # scores = []
+                # bbox = []
+                # class_id = []
+                # for i in range(self.num_classes):
+                #     bbox_yx_i = tf.reshape(center + offset, [-1, 2])
+                #     bbox_hw_i = tf.reshape(size, [-1, 2])
+                #     scores_i = tf.reshape(keypoints[..., i], [-1])
+                #     mask_i = scores_i > self.score_threshold
+                #     bbox_yx_i = tf.boolean_mask(bbox_yx_i, mask_i)
+                #     bbox_hw_i = tf.boolean_mask(bbox_hw_i, mask_i)
+                #     bbox_i = tf.concat([bbox_yx_i-bbox_hw_i/2., bbox_yx_i+bbox_hw_i/2.], axis=-1)
+                #     scores_i = tf.boolean_mask(scores_i, mask_i)
+                #     selected_indices = tf.image.non_max_suppression(
+                #
+                #         bbox_i, scores_i, 10, 0.45,
+                #     )
+                #     bbox_i = tf.gather(bbox_i, selected_indices)
+                #     scores_i = tf.gather(scores_i, selected_indices)
+                #     class_id_i = tf.zeros_like(scores_i, tf.int32) + i
+                #     bbox.append(bbox_i)
+                #     scores.append(scores_i)
+                #     class_id.append(class_id_i)
+                # bbox = tf.concat(bbox, axis=0) * stride
+                # scores = tf.concat(scores, axis=0)
+                # class_id = tf.concat(class_id, axis=0)
+                # self.detection_pred = [scores, bbox, class_id]
 
     def _compute_one_image_loss(self, keypoints, offset, size, ground_truth, meshgrid_y, meshgrid_x,
                                 stride, pshape):
@@ -199,36 +221,18 @@ class CenterNet:
         ngbbox_h = ground_truth[..., 2] / stride
         ngbbox_w = ground_truth[..., 3] / stride
         class_id = tf.cast(ground_truth[..., 4], dtype=tf.int32)
-        ngbbox_yx = tf.floor(ground_truth[..., 0:2] / stride)
-        noffset_y = ngbbox_y - ngbbox_yx[..., 0]
-        noffset_x = ngbbox_x - ngbbox_yx[..., 1]
-        ngbbox_yx = tf.cast(ngbbox_yx, tf.int64)
-        num_g = tf.cast(tf.shape(class_id)[0], tf.float32)
-
-        keypoints_loss = self._keypoints_loss(keypoints, ngbbox_yx, ngbbox_y, ngbbox_x, ngbbox_h,
+        ngbbox_yx = ground_truth[..., 0:2] / stride
+        ngbbox_yx_round = tf.round(ngbbox_yx)
+        offset_gt = ngbbox_yx - ngbbox_yx_round
+        size_gt = ground_truth[..., 2:4] / stride
+        ngbbox_yx_round_int = tf.cast(ngbbox_yx_round, tf.int64)
+        keypoints_loss = self._keypoints_loss(keypoints, ngbbox_yx_round_int, ngbbox_y, ngbbox_x, ngbbox_h,
                                               ngbbox_w, class_id, meshgrid_y, meshgrid_x, pshape)
 
-        mask = tf.sparse.to_dense(tf.sparse.SparseTensor(ngbbox_yx, tf.ones_like(ngbbox_y), dense_shape=pshape), validate_indices=False)
-        size_h_dense = tf.sparse.to_dense(tf.sparse.SparseTensor(ngbbox_yx, ngbbox_h, dense_shape=pshape), validate_indices=False)
-        size_w_dense = tf.sparse.to_dense(tf.sparse.SparseTensor(ngbbox_yx, ngbbox_w, dense_shape=pshape), validate_indices=False)
-        offset_y_dense = tf.sparse.to_dense(tf.sparse.SparseTensor(ngbbox_yx, noffset_y, dense_shape=pshape), validate_indices=False)
-        offset_x_dense = tf.sparse.to_dense(tf.sparse.SparseTensor(ngbbox_yx, noffset_x, dense_shape=pshape), validate_indices=False)
-        offset_gt = tf.concat(
-            [
-                tf.expand_dims(offset_y_dense, axis=-1),
-                tf.expand_dims(offset_x_dense, axis=-1),
-            ], axis=-1
-        )
-        size_gt = tf.concat(
-            [
-                tf.expand_dims(size_h_dense, axis=-1),
-                tf.expand_dims(size_w_dense, axis=-1),
-            ], axis=-1
-        )
-        offset = offset * tf.expand_dims(mask, axis=-1)
-        size = size * tf.expand_dims(mask, axis=-1)
-        offset_loss = tf.reduce_sum(tf.abs(offset_gt - offset)) / num_g
-        size_loss = tf.reduce_sum(tf.abs(size_gt - size)) / num_g
+        offset = tf.gather_nd(offset, ngbbox_yx_round_int)
+        size = tf.gather_nd(size, ngbbox_yx_round_int)
+        offset_loss = tf.reduce_mean(tf.abs(offset_gt - offset))
+        size_loss = tf.reduce_mean(tf.abs(size_gt - size))
         total_loss = keypoints_loss + 0.1*size_loss + offset_loss
         return total_loss
 
@@ -269,11 +273,12 @@ class CenterNet:
             gt_keypoints.append(gt_keypoints_i)
         reduction = tf.concat(reduction, axis=-1)
         gt_keypoints = tf.concat(gt_keypoints, axis=-1)
-        keypoints_pos_loss = -tf.pow(1.-tf.nn.sigmoid(keypoints), 2.) * tf.log_sigmoid(keypoints) * gt_keypoints
-        keypoints_neg_loss = -tf.pow(1.-reduction, 4.) * tf.pow(tf.nn.sigmoid(keypoints), 2.) * (-keypoints+tf.log_sigmoid(keypoints)) * (1.-gt_keypoints)
-        keypoints_loss = (tf.reduce_sum(keypoints_pos_loss) + tf.reduce_sum(keypoints_neg_loss)) / tf.cast(num_g, tf.float32)
+        keypoints_pos_loss = -tf.pow(1.-keypoints, 2.) * tf.log(keypoints+1e-12) * gt_keypoints
+        keypoints_neg_loss = -tf.pow(1.-reduction, 4) * tf.pow(keypoints, 2.) * tf.log(1.-keypoints+1e-12) * (1.-gt_keypoints)
+        keypoints_loss = tf.reduce_sum(keypoints_pos_loss) / tf.cast(num_g, tf.float32) + tf.reduce_sum(keypoints_neg_loss) / tf.cast(num_g, tf.float32)
         return keypoints_loss
 
+    # from cornernet
     def _gaussian_radius(self, height, width, min_overlap=0.7):
         a1 = 1.
         b1 = (height + width)
