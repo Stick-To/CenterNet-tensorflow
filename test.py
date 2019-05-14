@@ -57,7 +57,8 @@ trainset_provider = {
     'val_generator': None                                 # not used
 }
 centernet = net.CenterNet(config, trainset_provider)
-centernet.load_weight('./centernet/test-8350')
+# centernet.load_weight('./centernet/test-8350')
+# centernet.load_pretrained_weight('./centernet/test-8350')
 for i in range(epochs):
     print('-'*25, 'epoch', i, '-'*25)
     if i in reduce_lr_epoch:

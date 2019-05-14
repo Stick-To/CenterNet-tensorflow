@@ -181,37 +181,6 @@ class CenterNet:
                 select_bbox = tf.gather(bbox, select_indices)
                 self.detection_pred = [select_scores, select_bbox, select_class_id]
 
-                # per class nms
-                # keypoints_peak = self._max_pooling(keypoints, 3, 1)
-                # keypoints_mask = tf.cast(tf.equal(keypoints, keypoints_peak), tf.float32)
-                # keypoints = keypoints * keypoints_mask
-                # scores = []
-                # bbox = []
-                # class_id = []
-                # for i in range(self.num_classes):
-                #     bbox_yx_i = tf.reshape(center + offset, [-1, 2])
-                #     bbox_hw_i = tf.reshape(size, [-1, 2])
-                #     scores_i = tf.reshape(keypoints[..., i], [-1])
-                #     mask_i = scores_i > self.score_threshold
-                #     bbox_yx_i = tf.boolean_mask(bbox_yx_i, mask_i)
-                #     bbox_hw_i = tf.boolean_mask(bbox_hw_i, mask_i)
-                #     bbox_i = tf.concat([bbox_yx_i-bbox_hw_i/2., bbox_yx_i+bbox_hw_i/2.], axis=-1)
-                #     scores_i = tf.boolean_mask(scores_i, mask_i)
-                #     selected_indices = tf.image.non_max_suppression(
-                #
-                #         bbox_i, scores_i, 10, 0.45,
-                #     )
-                #     bbox_i = tf.gather(bbox_i, selected_indices)
-                #     scores_i = tf.gather(scores_i, selected_indices)
-                #     class_id_i = tf.zeros_like(scores_i, tf.int32) + i
-                #     bbox.append(bbox_i)
-                #     scores.append(scores_i)
-                #     class_id.append(class_id_i)
-                # bbox = tf.concat(bbox, axis=0) * stride
-                # scores = tf.concat(scores, axis=0)
-                # class_id = tf.concat(class_id, axis=0)
-                # self.detection_pred = [scores, bbox, class_id]
-
     def _compute_one_image_loss(self, keypoints, offset, size, ground_truth, meshgrid_y, meshgrid_x,
                                 stride, pshape):
         slice_index = tf.argmin(ground_truth, axis=0)[0]
@@ -304,6 +273,8 @@ class CenterNet:
             self.sess.run(self.train_initializer)
 
     def _create_saver(self):
+        weights = tf.trainable_variables('backone')
+        self.pretrained_saver = tf.train.Saver(weights)
         weights = tf.trainable_variables()
         self.saver = tf.train.Saver(weights)
         self.best_saver = tf.train.Saver(weights)
@@ -347,6 +318,10 @@ class CenterNet:
     def load_weight(self, path):
         self.saver.restore(self.sess, path)
         print('load weight', path, 'successfully')
+
+    def load_pretrained_weight(self, path):
+        self.pretrained_saver.restore(self.sess, path)
+        print('load pretrained weight', path, 'successfully')
 
     def _bn(self, bottom):
         bn = tf.layers.batch_normalization(
