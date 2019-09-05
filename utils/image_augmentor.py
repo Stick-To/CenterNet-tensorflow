@@ -6,7 +6,7 @@ import tensorflow as tf
 
 def image_augmentor(image, input_shape, data_format, output_shape, zoom_size=None,
                     crop_method=None, flip_prob=None, fill_mode='BILINEAR', keep_aspect_ratios=False,
-                    constant_values=0., rotate_range=None, ground_truth=None, pad_truth_to=None):
+                    constant_values=0., color_jitter_prob=None, rotate=None, ground_truth=None, pad_truth_to=None):
 
     """
     :param image: HWC or CHW
@@ -19,7 +19,8 @@ def image_augmentor(image, input_shape, data_format, output_shape, zoom_size=Non
     :param fill_mode: 'CONSTANT', 'NEAREST_NEIGHBOR', 'BILINEAR', 'BICUBIC'
     :param keep_aspect_ratios: True, False
     :param constant_values:
-    :param rotate_range:
+    :param color_jitter_prob: prob of color_jitter
+    :param rotate: [prob, min_angle, max_angle]
     :param ground_truth: [ymin, ymax, xmin, xmax, classid]
     :param pad_truth_to: pad ground_truth to size [pad_truth_to, 5] with -1
     :return image: output_shape
@@ -41,16 +42,22 @@ def image_augmentor(image, input_shape, data_format, output_shape, zoom_size=Non
             raise Exception("crop_method must in ['random', 'center']!")
         if fill_mode is 'CONSTANT' and constant_values is None:
             raise Exception("please provide constant_values!")
-
+    if color_jitter_prob is not None:
+        if not 0. <= color_jitter_prob <= 1.:
+            raise Exception("color_jitter_prob can't less that 0.0, and can't grater that 1.0")
     if flip_prob is not None:
         if not 0. <= flip_prob[0] <= 1. and 0. <= flip_prob[1] <= 1.:
-            raise Exception("flip_prob can't less that 0.0, and can't grater that 1.0")
-    if rotate_range is not None:
+            raise Exception("flip_prob can't less than 0.0, and can't grater than 1.0")
+    if rotate is not None:
+        if len(rotate) != 3:
+            raise Exception('please provide "rotate" parameter as [rotate_prob, min_angle, max_angle]!')
+        if not 0. <= rotate[0] <= 1.:
+            raise Exception("rotate prob can't less that 0.0, and can't grater that 1.0")
         if ground_truth is not None:
-            if not -5. <= rotate_range[0] <= 5. and -5. <= rotate_range[1] <= 5.:
+            if not -5. <= rotate[1] <= 5. and -5. <= rotate[2] <= 5.:
                 raise Exception('rotate range must be -5 to 5, otherwise coordinate mapping become imprecise!')
-        if not rotate_range[0] <= rotate_range[1]:
-            raise Exception("rotate_range[0] can't  grater than rotate_range[1]")
+        if not rotate[1] <= rotate[2]:
+            raise Exception("rotate[1] can't  grater than rotate[2]")
 
     if fill_mode == 'CONSTANT':
         keep_aspect_ratios = True
@@ -65,7 +72,11 @@ def image_augmentor(image, input_shape, data_format, output_shape, zoom_size=Non
         xmin = tf.reshape(ground_truth[:, 2], [-1, 1])
         xmax = tf.reshape(ground_truth[:, 3], [-1, 1])
         class_id = tf.reshape(ground_truth[:, 4], [-1, 1])
-
+        yy = (ymin + ymax) / 2.
+        xx = (xmin + xmax) / 2.
+        hh = ymax - ymin
+        ww = xmax -xmin
+    image_copy = image
     if data_format == 'channels_first':
         image = tf.transpose(image, [1, 2, 0])
     input_h, input_w, input_c = input_shape[0], input_shape[1], input_shape[2]
@@ -145,23 +156,38 @@ def image_augmentor(image, input_shape, data_format, output_shape, zoom_size=Non
         if ground_truth is not None:
             ymax, ymin = tf.cond(
                 tf.less(flip_td_prob, flip_prob[0]),
-                lambda: (output_h - ymin, output_h - ymax),
+                lambda: (output_h - ymin -1., output_h - ymax -1.),
                 lambda: (ymax, ymin)
             )
             xmax, xmin = tf.cond(
                 tf.less(flip_lr_prob, flip_prob[1]),
-                lambda: (output_w - xmin, output_w - xmax),
+                lambda: (output_w - xmin -1., output_w - xmax - 1.),
                 lambda: (xmax, xmin)
             )
-    if rotate_range is not None:
-        angles = tf.random_uniform([], rotate_range[0], rotate_range[1]) * 3.1415926 / 180.
+    if color_jitter_prob is not None:
+        bcs = tf.random_uniform([3], 0., 1.)
+        image = tf.cond(bcs[0] < color_jitter_prob,
+                        lambda: tf.image.adjust_brightness(image, tf.random_uniform([], 0., 0.3)),
+                        lambda: image
+                )
+        image = tf.cond(bcs[1] < color_jitter_prob,
+                        lambda: tf.image.adjust_contrast(image, tf.random_uniform([], 0.8, 1.2)),
+                        lambda: image
+                )
+        image = tf.cond(bcs[2] < color_jitter_prob,
+                        lambda: tf.image.adjust_hue(image, tf.random_uniform([], -0.1, 0.1)),
+                        lambda: image
+                )
+
+    if rotate is not None:
+        angles = tf.random_uniform([], rotate[1], rotate[2]) * 3.1415926 / 180.
         image = tf.contrib.image.rotate(image, angles, 'BILINEAR')
         if ground_truth is not None:
             angles = -angles
             rotate_center_x = (output_w - 1.) / 2.
             rotate_center_y = (output_h - 1.) / 2.
             offset_x = rotate_center_x * (1-tf.cos(angles)) + rotate_center_y * tf.sin(angles)
-            offset_y = rotate_center_y * (1-tf.cos(angles)) - rotate_center_y * tf.sin(angles)
+            offset_y = rotate_center_y * (1-tf.cos(angles)) - rotate_center_x * tf.sin(angles)
             xminymin_x = xmin * tf.cos(angles) - ymin * tf.sin(angles) + offset_x
             xminymin_y = xmin * tf.sin(angles) + ymin * tf.cos(angles) + offset_y
             xmaxymax_x = xmax * tf.cos(angles) - ymax * tf.sin(angles) + offset_x
@@ -179,8 +205,8 @@ def image_augmentor(image, input_shape, data_format, output_shape, zoom_size=Non
     if ground_truth is not None:
         y_center = (ymin + ymax) / 2.
         x_center = (xmin + xmax) / 2.
-        y_mask = tf.cast(y_center >= 0., tf.float32) * tf.cast(y_center <= output_h - 1., tf.float32)
-        x_mask = tf.cast(x_center >= 0., tf.float32) * tf.cast(x_center <= output_w - 1., tf.float32)
+        y_mask = tf.cast(y_center > 0., tf.float32) * tf.cast(y_center < output_h - 1., tf.float32)
+        x_mask = tf.cast(x_center > 0., tf.float32) * tf.cast(x_center < output_w - 1., tf.float32)
         mask = tf.reshape((x_mask * y_mask) > 0., [-1])
         ymin = tf.boolean_mask(ymin, mask)
         xmin = tf.boolean_mask(xmin, mask)
@@ -199,14 +225,23 @@ def image_augmentor(image, input_shape, data_format, output_shape, zoom_size=Non
         x = (xmin + xmax) / 2.
         h = ymax - ymin
         w = xmax - xmin
-        ground_truth = tf.concat([y, x, h, w, class_id], axis=-1)
+        ground_truth_ = tf.concat([y, x, h, w, class_id], axis=-1)
 
-        if pad_truth_to is not None:
-            ground_truth = tf.pad(
-                            ground_truth, [[0, pad_truth_to-tf.shape(ground_truth)[0]], [0, 0]],
-                            constant_values=-1.0
-                        )
-        return image, ground_truth
+        if tf.shape(ground_truth_)[0] == 0:
+            if pad_truth_to is not None:
+                ground_truth_ = tf.concat([yy, xx, hh, ww, class_id], axis=-1)
+                ground_truth = tf.pad(
+                                ground_truth_, [[0, pad_truth_to-tf.shape(ground_truth)[0]], [0, 0]],
+                                constant_values=-1.0
+                            )
+            return image_copy, ground_truth
+        else:
+            if pad_truth_to is not None:
+                ground_truth = tf.pad(
+                                ground_truth_, [[0, pad_truth_to-tf.shape(ground_truth_)[0]], [0, 0]],
+                                constant_values=-1.0
+                            )
+            return image, ground_truth
     else:
         return image
 

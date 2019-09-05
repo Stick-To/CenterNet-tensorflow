@@ -35,15 +35,17 @@ config = {
 image_augmentor_config = {
     'data_format': 'channels_last',
     'output_shape': [384, 384],
-    # 'zoom_size': [400, 400],
-    # 'crop_method': 'random',
+    'zoom_size': [400, 400],
+    'crop_method': 'random',
     'flip_prob': [0., 0.5],
     'fill_mode': 'BILINEAR',
     'keep_aspect_ratios': False,
-    # 'constant_values': 0.,
-    # 'rotate_range': [-5., 5.],
+    'constant_values': 0.,
+    'color_jitter_prob': 0.5,
+    'rotate': [0.5, -5., -5.],
     'pad_truth_to': 60,
 }
+
 data = os.listdir('./voc2007/')
 data = [os.path.join('./voc2007/', name) for name in data]
 
